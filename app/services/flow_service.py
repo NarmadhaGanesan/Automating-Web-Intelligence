@@ -9,8 +9,12 @@ logger = logging.getLogger(__name__)
 
 class FlowGenerationService:
     def __init__(self):
-        self.api_key = settings.OPENAI_API_KEY
+        # Use ASI-1 API instead of OpenAI (mandatory for hackathon)
+        self.api_key = settings.ASI_ONE_API_KEY
+        self.api_url = settings.ASI_ONE_API_URL
+        self.model = settings.ASI_ONE_MODEL
         masked_key = f"{self.api_key[:10]}...{self.api_key[-5:]}" if self.api_key else "None"
+        logger.info(f"FlowGenerationService initialized with ASI-1 key: {masked_key}")
         logger.info(f"FlowGenerationService initialized with key: {masked_key}")
         self.openai_url = "https://api.openai.com/v1/chat/completions"
 
@@ -44,6 +48,11 @@ JSON Structure (return ONLY this, no explanation):
 }
 """
 
+            # Try ASI-1 First (mandatory for hackathon)
+            if self.api_key and self.api_key != "None" and self.api_key != "your-asi1-api-key-here":
+                try:
+                    payload = {
+                        "model": self.model,
             # Try OpenAI First - only if API key is available
             if self.api_key and self.api_key != "None":
                 try:
@@ -53,6 +62,10 @@ JSON Structure (return ONLY this, no explanation):
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": f"Generate a flow for: {prompt}"}
                         ],
+                        "temperature": 0.7,
+                        "max_tokens": 1000
+                    }
+                    async with httpx.AsyncClient(timeout=30.0) as client:
                         "response_format": {"type": "json_object"}
                     }
                     async with httpx.AsyncClient(timeout=20.0) as client:
@@ -60,11 +73,38 @@ JSON Structure (return ONLY this, no explanation):
                             "Content-Type": "application/json",
                             "Authorization": f"Bearer {self.api_key}"
                         }
+                        response = await client.post(
+                            f"{self.api_url}/chat/completions",
+                            json=payload,
+                            headers=headers
+                        )
                         response = await client.post(self.openai_url, json=payload, headers=headers)
                         
                         if response.status_code == 200:
                             data = response.json()
                             content = data["choices"][0]["message"]["content"]
+                            # Try to extract JSON from the response
+                            json_match = re.search(r'\{[\s\S]*\}', content)
+                            if json_match:
+                                result = json.loads(json_match.group())
+                                if "nodes" in result and "edges" in result:
+                                    logger.info("Flow generated successfully via ASI-1 API")
+                                    return result
+                            # If direct parse works
+                            try:
+                                result = json.loads(content)
+                                if "nodes" in result and "edges" in result:
+                                    logger.info("Flow generated successfully via ASI-1 API")
+                                    return result
+                            except json.JSONDecodeError:
+                                pass
+                            logger.warning("ASI-1 response didn't contain valid flow JSON, falling back")
+                        else:
+                            logger.warning(f"ASI-1 failed ({response.status_code}), falling back to heuristic")
+                except Exception as e:
+                    logger.warning(f"ASI-1 error: {str(e)}, falling back to heuristic")
+            else:
+                logger.warning("ASI-1 API key not configured, using heuristic fallback")
                             logger.info("Flow generated successfully via OpenAI")
                             return json.loads(content)
                         else:
@@ -124,6 +164,9 @@ JSON Structure (return ONLY this, no explanation):
         summarize_related = any(kw in p for kw in ['summarize', 'summary', 'news', 'top', 'bullet', 'brief', 'overview'])
         
         if detected_url and (url_related or summarize_related):
+            num_match = re.search(r'(\d+)\s*(top|latest|recent|urls?|results?|news)', p)
+            num = int(num_match.group(1)) if num_match else 5
+
             # Determine how many results
             num_match = re.search(r'(\d+)\s*(top|latest|recent|urls?|results?|news)', p)
             num = int(num_match.group(1)) if num_match else 5
@@ -178,6 +221,10 @@ JSON Structure (return ONLY this, no explanation):
                 edges.append({"id": "e_s_e", "source": "search_1", "target": "extract_1"})
                 last_node = "extract_1"
 
+            qa_keywords = ['qa', 'ask', 'find the best', 'summarize', 'compare', 'analyze', 'explain', 'describe', 'tell', 'what']
+            needs_qa = any(kw in p for kw in qa_keywords)
+            
+            if needs_qa or len(prompt) > 10:
             # Add QA node if asked or by default for search queries with certain indicators
             qa_keywords = ['qa', 'ask', 'find the best', 'summarize', 'compare', 'analyze', 'explain', 'describe', 'tell', 'what']
             needs_qa = any(kw in p for kw in qa_keywords)
